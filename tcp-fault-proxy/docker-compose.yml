@@ -7,9 +7,13 @@ services:
       RECEIVER_HOST: 0.0.0.0
       RECEIVER_TCP_PORT: "9100"
       RECEIVER_HTTP_PORT: "9101"
+      # 回执库落在命名数据卷上：容器重启/重建后 /receipts 仍可查。
+      RECEIVER_DB: /data/receipts.db
+    volumes:
+      - receiver-data:/data
     ports:
-      - "127.0.0.1:9100:9100"
-      - "127.0.0.1:9101:9101"
+      - "127.0.0.1:9100:9100"   # 上传 TCP 入口
+      - "127.0.0.1:9101:9101"   # 回执查询 API 与 /docs
 
   proxy:
     image: tcp-fault-proxy:latest
@@ -40,3 +44,6 @@ services:
     ports:
       # 发送器自己的控制 API / docs
       - "127.0.0.1:8081:8080"
+
+volumes:
+  receiver-data:

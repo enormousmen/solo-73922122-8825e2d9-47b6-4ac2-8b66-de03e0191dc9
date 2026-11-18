@@ -6,6 +6,7 @@ Stdlib only. Talks to:
   * sender API         (default 127.0.0.1:8081)
   * receiver HTTP API  (default 127.0.0.1:9101)
   * proxy TCP ingress  (default 127.0.0.1:9000)
+  * receiver TCP port  (default 127.0.0.1:9100, for the no-FIN abort case)
 
 Scenarios:
   1. baseline: no preset, full upload, hashes match on both ends;
@@ -13,12 +14,22 @@ Scenarios:
      no loss / duplication / reordering (hash + byte count match);
   3. pause exactly at N across multiple read blocks (odd N);
   4. manual pause / resume;
-  5. reverse (r2c) pause still lets the upload finish, receipt delivered
-     after resume;
+  5. reverse (r2c) pause still lets the upload finish, digest is published
+     before the receipt wait, receipt delivered after resume;
   6. force-close interrupts paused direction and blocked write, tasks exit,
      control API and other connections stay usable;
   7. backpressure: while paused the sender cannot drain the whole sample and
-     proxy per-direction user-space backlog stays <= 256 KiB.
+     proxy per-direction user-space backlog stays <= 256 KiB;
+  8. receipts are queryable by sha256+bytes and identical content uploaded
+     twice is kept as two records with distinct receipt ids;
+  9. an upload aborted without FIN (TCP RST) leaves no record and gets no
+     receipt;
+ 10. the receipt is committed to SQLite before delivery: pausing the receipt
+     direction mid-receipt still shows the committed record, force-closing
+     the link fails the sender run (no valid receipt -> never "done") while
+     the record stays queryable;
+ 11. optional (RECEIVER_RESTART_CMD set): committed receipts survive a
+     receiver restart and new uploads still work afterwards.
 """
 
 from __future__ import annotations
@@ -28,6 +39,8 @@ import http.client
 import json
 import os
 import socket
+import struct
+import subprocess
 import sys
 import time
 
@@ -35,6 +48,7 @@ PROXY_API = os.getenv("PROXY_API", "127.0.0.1:8080")
 SENDER_API = os.getenv("SENDER_API", "127.0.0.1:8081")
 RECEIVER_API = os.getenv("RECEIVER_API", "127.0.0.1:9101")
 PROXY_TCP = os.getenv("PROXY_TCP", "127.0.0.1:9000")
+RECEIVER_TCP = os.getenv("RECEIVER_TCP", "127.0.0.1:9100")
 
 PASS, FAIL = "PASS", "FAIL"
 results: list[tuple[str, str, str]] = []
@@ -100,7 +114,17 @@ def clear_preset() -> None:
 
 
 def receiver_count() -> int:
-    return len(http_json(RECEIVER_API, "GET", "/receipts"))
+    return len(http_json(RECEIVER_API, "GET", "/receipts?limit=5000"))
+
+
+def query_receipts(sha256: str, byte_count: int) -> list[dict]:
+    return http_json(RECEIVER_API, "GET", f"/receipts?sha256={sha256}&bytes={byte_count}")
+
+
+def is_digest(value) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        c in "0123456789abcdef" for c in value
+    )
 
 
 def wait_receiver_count(target: int, timeout: float = 15.0) -> int:
@@ -283,10 +307,13 @@ def main() -> int:
           conn["directions"]["c2r"]["half_closed_delivered"] is True)
     run_mid = http_json(SENDER_API, "GET", f"/sends/{run['run_id']}")
     check("sender still waiting for receipt", run_mid["phase"] == "waiting-receipt")
+    check("digest published before receipt wait", is_digest(run_mid.get("upload_sha256")),
+          f"upload_sha256={run_mid.get('upload_sha256')}")
     http_json(PROXY_API, "POST", f"/connections/{cid}/resume", {"direction": "r2c"})
     run = wait_sender(run["run_id"])
     check("receipt delivered after r2c resume", run["phase"] == "done"
           and run["hash_match"] is True)
+    check("published digest matches receipt", run["upload_sha256"] == run["receipt"]["sha256"])
     clear_preset()
 
     # 6. Force-close ------------------------------------------------------- #
@@ -352,6 +379,108 @@ def main() -> int:
     run = wait_sender(run["run_id"])
     check("backpressure test finishes clean", run["hash_match"] is True)
     clear_preset()
+
+    # 8. Query by digest/bytes; duplicate content -> distinct records ------ #
+    # raw_upload uses a fixed deterministic pattern, so two uploads of the
+    # same size produce identical content (same sha256 + bytes).
+    sock1, h1 = raw_upload(size, None)
+    receipt1 = json.loads(recv_all(sock1).decode().strip().splitlines()[-1])
+    sock1.close()
+    sock2, h2 = raw_upload(size, None)
+    receipt2 = json.loads(recv_all(sock2).decode().strip().splitlines()[-1])
+    sock2.close()
+    check("identical uploads share digest",
+          h1 == h2 == receipt1["sha256"] == receipt2["sha256"])
+    check("duplicate content kept as distinct receipt ids",
+          receipt1["receipt_id"] != receipt2["receipt_id"],
+          f"{receipt1['receipt_id']} vs {receipt2['receipt_id']}")
+    matches = query_receipts(h1, size)
+    matched_ids = {m["receipt_id"] for m in matches}
+    check("receipts queryable by sha256+bytes",
+          {receipt1["receipt_id"], receipt2["receipt_id"]} <= matched_ids,
+          f"matched={len(matches)}")
+    check("query result echoes digest and bytes",
+          all(m["sha256"] == h1 and m["bytes"] == size for m in matches))
+    one = http_json(RECEIVER_API, "GET", f"/receipts/{receipt1['receipt_id']}")
+    check("receipt fetchable by id",
+          one["sha256"] == h1 and one["bytes"] == size and one["eof_seen"] is True)
+
+    # 9. No FIN -> no record, no receipt (direct to the receiver TCP port) -- #
+    before = receiver_count()
+    rx_host, rx_port = RECEIVER_TCP.split(":")
+    abort_sock = socket.create_connection((rx_host, int(rx_port)), timeout=5)
+    abort_sock.sendall(b"partial-upload-that-never-finishes")
+    # SO_LINGER(1, 0): close() sends RST instead of FIN.
+    abort_sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    abort_sock.close()
+    check("aborted upload (no FIN) leaves no record", assert_count_stable(before),
+          f"count={receiver_count()} expected={before}")
+
+    # 10. Receipt committed before delivery; sender never fakes success ----- #
+    set_preset(r2c=16)  # pause the receipt direction after 16 bytes
+    run = start_send(size)
+    conn = wait_conn_active()
+    cid = conn["id"]
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        conn = http_json(PROXY_API, "GET", f"/connections/{cid}")
+        if conn["directions"]["r2c"]["paused"]:
+            break
+        time.sleep(0.05)
+    check("receipt direction paused mid-receipt",
+          conn["directions"]["r2c"]["paused"] is True)
+    run_mid = http_json(SENDER_API, "GET", f"/sends/{run['run_id']}")
+    check("sender waiting for receipt (link stalled)",
+          run_mid["phase"] == "waiting-receipt")
+    interrupted_digest = run_mid.get("upload_sha256")
+    check("digest published while receipt link stalled", is_digest(interrupted_digest))
+    # The receiver commits BEFORE sending: the record must already be
+    # queryable even though the receipt bytes have not reached the sender.
+    committed = query_receipts(interrupted_digest, size)
+    check("receipt committed before delivery completes", len(committed) >= 1,
+          f"matched={len(committed)}")
+    # Interrupt the receipt link for good: the sender must not succeed.
+    http_json(PROXY_API, "POST", f"/connections/{cid}/force-close", {})
+    run = wait_sender(run["run_id"])
+    check("no valid receipt -> run failed, not done", run["phase"] == "failed",
+          f"phase={run['phase']} error={run.get('error')}")
+    check("failed run carries no success flags",
+          run["hash_match"] is not True and run["byte_match"] is not True)
+    still_there = query_receipts(interrupted_digest, size)
+    check("committed receipt survives interrupted delivery", len(still_there) >= 1)
+    clear_preset()
+
+    # 11. Restart persistence (optional: set RECEIVER_RESTART_CMD) ---------- #
+    restart_cmd = os.getenv("RECEIVER_RESTART_CMD")
+    if restart_cmd:
+        before = receiver_count()
+        started_before = http_json(RECEIVER_API, "GET", "/health")["started_at"]
+        subprocess.run(restart_cmd, shell=True, check=True)
+        deadline = time.time() + 60
+        health = {}
+        while time.time() < deadline:
+            try:
+                health = http_json(RECEIVER_API, "GET", "/health", timeout=2)
+                if health["status"] == "ok" and health["started_at"] > started_before:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+        check("receiver healthy after restart", health.get("status") == "ok")
+        check("receiver process actually restarted",
+              health.get("started_at", 0) > started_before,
+          f"before={started_before} after={health.get('started_at')}")
+        check("receipt count survives restart", receiver_count() >= before,
+              f"count={receiver_count()} expected>={before}")
+        check("interrupted-run receipt queryable after restart",
+              len(query_receipts(interrupted_digest, size)) >= 1)
+        run = start_send(size)
+        run = wait_sender(run["run_id"])
+        check("upload after restart works",
+              run["phase"] == "done" and run["hash_match"] is True,
+              run.get("error") or "")
+    else:
+        print("[SKIP] restart persistence (set RECEIVER_RESTART_CMD to enable)")
 
     # Summary -------------------------------------------------------------- #
     failed = [r for r in results if r[0] == FAIL]

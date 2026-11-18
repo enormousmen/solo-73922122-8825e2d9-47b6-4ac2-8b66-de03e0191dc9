@@ -9,6 +9,12 @@ FastAPI control plane + raw asyncio TCP uploader in one process:
 * GET  /sends  lists recent runs with byte counts, hashes and timing;
 * GET  /docs   interactive UI to launch a send and inspect the receipt.
 
+The run's SHA-256 digest is published (GET /sends/{id}) BEFORE the run enters
+the receipt-wait phase, so a stalled receipt link can be cross-checked against
+the receiver's persisted /receipts.  A run is marked done only when a valid
+receipt arrives (parseable JSON, digest and byte count matching this upload);
+a missing, corrupt or mismatching receipt marks the run failed, never done.
+
 The payload is a deterministic, reproducible byte stream (chained SHA-256
 blocks), so receiver and sender hashes can be compared byte-for-byte.  Blocks
 are generated on demand; the whole 32 MiB sample is never held in memory here.
@@ -85,6 +91,11 @@ async def _do_send(run_id: str, size: int, host: str, port: int) -> None:
             index += 1
             run["bytes_sent"] = size - remaining
 
+        # Publish this run's digest BEFORE entering the receipt wait, so the
+        # duty operator can query the receiver's /receipts by sha256+bytes
+        # even if the receipt never arrives.
+        run["bytes_sent"] = size
+        run["upload_sha256"] = digest.hexdigest()
         run["phase"] = "uploaded-half-closing"
         # Half-close: FIN goes through the proxy, which must hold it until
         # any paused backlog of this direction has been forwarded.
@@ -103,22 +114,29 @@ async def _do_send(run_id: str, size: int, host: str, port: int) -> None:
             run["elapsed_seconds"] = round(time.monotonic() - started, 6)
             return
         elapsed = time.monotonic() - started
-        run["upload_sha256"] = digest.hexdigest()
-        run["bytes_sent"] = size
         run["reverse_bytes"] = len(raw)
-        run["phase"] = "done"
         run["elapsed_seconds"] = round(elapsed, 6)
         try:
             receipt = json.loads(raw.decode().strip().splitlines()[-1])
         except (ValueError, UnicodeDecodeError, IndexError):
             receipt = None
         run["receipt"] = receipt
-        if receipt is not None:
-            run["hash_match"] = receipt.get("sha256") == digest.hexdigest()
-            run["byte_match"] = receipt.get("bytes") == size
+        run["hash_match"] = receipt is not None and receipt.get("sha256") == digest.hexdigest()
+        run["byte_match"] = receipt is not None and receipt.get("bytes") == size
+        # Success requires a VALID receipt: parseable JSON whose digest and
+        # byte count match this upload.  Anything else is a failure, never
+        # a success.
+        if receipt is not None and run["hash_match"] and run["byte_match"]:
+            run["phase"] = "done"
         else:
-            run["hash_match"] = False
-            run["byte_match"] = False
+            run["phase"] = "failed"
+            if receipt is None:
+                run["error"] = "no valid receipt JSON received before EOF"
+            else:
+                run["error"] = (
+                    "receipt mismatch: "
+                    f"hash_match={run['hash_match']} byte_match={run['byte_match']}"
+                )
     except (ConnectionError, asyncio.CancelledError, RuntimeError, OSError) as exc:
         run["phase"] = "failed"
         run["error"] = repr(exc)
@@ -134,8 +152,12 @@ async def _do_send(run_id: str, size: int, host: str, port: int) -> None:
 
 app = FastAPI(
     title="本地发送器 (Local Sample Sender)",
-    description="通过故障代理上传采样包（默认 32 MiB），半关闭后读取接收端回执。",
-    version="1.0.0",
+    description=(
+        "通过故障代理上传采样包（默认 32 MiB），半关闭后读取接收端回执。"
+        "进入回执等待前即公开本次 SHA-256 摘要；只有收到摘要与字节数都匹配的"
+        "有效回执才标记成功，否则一律 failed。"
+    ),
+    version="1.1.0",
 )
 
 

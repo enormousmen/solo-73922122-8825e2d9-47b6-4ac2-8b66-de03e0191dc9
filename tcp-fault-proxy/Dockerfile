@@ -10,6 +10,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . /app
 
+# Receipt database location when RECEIVER_DB=/data/receipts.db is used
+# (compose mounts the receiver-data volume here).
+RUN mkdir -p /data
+
 # SERVICE (set per compose service) selects which component the container runs.
 ENV SERVICE=proxy
 EXPOSE 8080 9000 9100 9101

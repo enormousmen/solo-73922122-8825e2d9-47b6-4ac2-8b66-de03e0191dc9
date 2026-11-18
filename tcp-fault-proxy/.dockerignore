@@ -5,3 +5,7 @@ __pycache__
 .pytest_cache
 .git
 *.log
+.data
+*.db
+*.db-wal
+*.db-shm

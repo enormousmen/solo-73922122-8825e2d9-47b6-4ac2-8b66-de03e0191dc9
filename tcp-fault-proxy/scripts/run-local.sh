@@ -6,7 +6,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="${1:-$ROOT/.venv}"
 LOG_DIR="${LOG_DIR:-/tmp/fp-logs}"
-mkdir -p "$LOG_DIR"
+DATA_DIR="${DATA_DIR:-$ROOT/.data}"
+mkdir -p "$LOG_DIR" "$DATA_DIR"
 
 if [ ! -x "$VENV/bin/python" ]; then
   echo "creating venv at $VENV (needs python3 with venv support)"
@@ -19,7 +20,8 @@ if [ ! -x "$VENV/bin/python" ]; then
 fi
 
 cd "$ROOT"
-nohup "$VENV/bin/python" -m receiver.app \
+RECEIVER_DB="$DATA_DIR/receipts.db" \
+  nohup "$VENV/bin/python" -m receiver.app \
   > "$LOG_DIR/receiver.log" 2>&1 & echo $! > "$LOG_DIR/receiver.pid"
 
 TARGET_HOST=127.0.0.1 TARGET_PORT=9100 PROXY_PORT=9000 \
@@ -31,7 +33,8 @@ SENDER_TARGET_HOST=127.0.0.1 SENDER_TARGET_PORT=9000 \
   > "$LOG_DIR/sender.log" 2>&1 & echo $! > "$LOG_DIR/sender.pid"
 
 sleep 2
-echo "receiver : TCP 127.0.0.1:9100, receipts API http://127.0.0.1:9101 (pid $(cat "$LOG_DIR/receiver.pid"))"
-echo "proxy    : TCP 127.0.0.1:9000, control/docs  http://127.0.0.1:8080 (pid $(cat "$LOG_DIR/proxy.pid"))"
-echo "sender   : control/docs        http://127.0.0.1:8081 (pid $(cat "$LOG_DIR/sender.pid"))"
+echo "receiver : TCP 127.0.0.1:9100, receipts API/docs http://127.0.0.1:9101/docs (pid $(cat "$LOG_DIR/receiver.pid"))"
+echo "           receipts db: $DATA_DIR/receipts.db (survives process restarts)"
+echo "proxy    : TCP 127.0.0.1:9000, control/docs  http://127.0.0.1:8080/docs (pid $(cat "$LOG_DIR/proxy.pid"))"
+echo "sender   : control/docs        http://127.0.0.1:8081/docs (pid $(cat "$LOG_DIR/sender.pid"))"
 echo "logs:     $LOG_DIR/{receiver,proxy,sender}.log"
